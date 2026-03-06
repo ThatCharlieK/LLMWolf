@@ -1,83 +1,47 @@
-"""Text-to-speech module using pyttsx3 with macOS NSSpeechSynthesizer.
+"""Text-to-speech module using macOS built-in `say` command.
 
 Provides blocking and non-blocking speech synthesis. Falls back gracefully
-if pyttsx3 is unavailable — never crashes the game.
+if `say` is unavailable — never crashes the game.
 """
 
-import threading
+import shutil
+import subprocess
 from rich.console import Console
 
 console = Console()
 
-_engine = None
 _tts_enabled = False
 
 
-def init_tts(rate: int = 180):
-    """Initialize the pyttsx3 TTS engine.
-
-    Args:
-        rate: Speech rate in words per minute (default 180).
-    """
-    global _engine, _tts_enabled
-    try:
-        import pyttsx3
-        _engine = pyttsx3.init()
-        _engine.setProperty("rate", rate)
-        _tts_enabled = True
-    except Exception as e:
-        console.print(f"[dim]TTS unavailable: {e}[/dim]")
-        _tts_enabled = False
+def init_tts():
+    """Initialize TTS by verifying the macOS `say` command is available."""
+    global _tts_enabled
+    _tts_enabled = shutil.which("say") is not None
+    if not _tts_enabled:
+        console.print("[dim]TTS unavailable: 'say' command not found[/dim]")
 
 
 def speak(text: str):
-    """Speak text aloud, blocking until finished.
+    """Speak text aloud using macOS `say`, blocking until finished.
 
     Silently skips if TTS is not initialized.
     """
-    if not _tts_enabled or _engine is None:
+    if not _tts_enabled:
         return
     try:
-        _engine.say(text)
-        _engine.runAndWait()
+        subprocess.run(["say", text], check=False)
     except Exception:
         return
 
 
 def speak_async(text: str):
-    """Speak text in a background thread (non-blocking).
+    """Speak text in the background (non-blocking).
 
     Silently skips if TTS is not initialized.
     """
-    if not _tts_enabled or _engine is None:
-        return
-    thread = threading.Thread(target=speak, args=(text,), daemon=True)
-    thread.start()
-
-
-def set_voice(voice_id: str):
-    """Change the TTS voice by its system identifier.
-
-    On macOS, list available voices with:
-        pyttsx3.init().getProperty('voices')
-    """
-    if not _tts_enabled or _engine is None:
+    if not _tts_enabled:
         return
     try:
-        _engine.setProperty("voice", voice_id)
+        subprocess.Popen(["say", text])
     except Exception:
         return
-
-
-def list_voices() -> list[dict]:
-    """Return available system voices as a list of dicts with id and name.
-
-    Returns empty list if TTS is not initialized.
-    """
-    if not _tts_enabled or _engine is None:
-        return []
-    try:
-        voices = _engine.getProperty("voices")
-        return [{"id": v.id, "name": v.name} for v in voices]
-    except Exception:
-        return []

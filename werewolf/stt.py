@@ -8,7 +8,6 @@ Set the HF_TOKEN environment variable or pass it to init functions.
 """
 
 import os
-import tempfile
 import threading
 from dataclasses import dataclass, field
 
@@ -43,8 +42,6 @@ def _detect_device() -> str:
     """Detect the best available compute device for inference."""
     try:
         import torch
-        if torch.backends.mps.is_available():
-            return "mps"
         if torch.cuda.is_available():
             return "cuda"
     except Exception:
@@ -80,13 +77,13 @@ def init_stt(model_size: str = "base", hf_token: str | None = None):
             console.print("[dim]Loading diarization pipeline...[/dim]")
             from whisperx.diarize import DiarizationPipeline
             _diarize_pipeline = DiarizationPipeline(
-                use_auth_token=_hf_token, device=_device
+                token=_hf_token, device=_device
             )
 
             console.print("[dim]Loading speaker embedding model...[/dim]")
             from pyannote.audio import Model, Inference
             embed_model = Model.from_pretrained(
-                "pyannote/embedding", use_auth_token=_hf_token
+                "pyannote/embedding", token=_hf_token
             )
             _embedding_inference = Inference(embed_model, window="whole")
         else:
@@ -197,27 +194,17 @@ def record_audio_interruptible(
     return trimmed
 
 
-def _save_temp_wav(audio: np.ndarray, sample_rate: int = SAMPLE_RATE) -> str:
-    """Save audio array to a temporary WAV file and return the path."""
-    import soundfile as sf
-
-    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-    sf.write(tmp.name, audio, sample_rate)
-    tmp.close()
-    return tmp.name
-
-
 def _extract_embedding(audio: np.ndarray, sample_rate: int = SAMPLE_RATE) -> np.ndarray:
     """Extract a speaker embedding from an audio clip using pyannote.
 
     Returns a 1D numpy array (the embedding vector).
     """
-    wav_path = _save_temp_wav(audio, sample_rate)
-    try:
-        embedding = _embedding_inference(wav_path)
-        return embedding.flatten()
-    finally:
-        os.unlink(wav_path)
+    import torch
+
+    waveform = torch.from_numpy(audio).unsqueeze(0)  # (1, num_samples)
+    file = {"waveform": waveform, "sample_rate": sample_rate}
+    embedding = _embedding_inference(file)
+    return embedding.flatten()
 
 
 def enroll_speakers(
@@ -266,15 +253,28 @@ def _match_speaker_to_player(
     enrollments: dict[str, np.ndarray],
     threshold: float = 0.6,
 ) -> str:
-    """Match a speaker embedding to the closest enrolled player.
+    """Resolve a generic diarization label (e.g. "SPEAKER_00") to a real player name.
+
+    Pyannote diarization assigns arbitrary speaker labels. This function compares
+    an unknown speaker's voice embedding against every enrolled player's embedding
+    using cosine distance, returning the closest match. If no enrolled player is
+    close enough (within the threshold), returns "Unknown" to avoid false attribution.
+
+    Cosine distance ranges from 0 (identical) to 2 (opposite). The default 0.6
+    threshold is permissive enough to handle mic variation while rejecting clear
+    mismatches.
 
     Args:
-        speaker_embedding: Embedding of the unknown speaker.
-        enrollments: Dict of player name → embedding from enrollment.
-        threshold: Maximum cosine distance to accept a match (0-2 scale).
+        speaker_embedding: Voice embedding vector extracted from a diarized audio
+                           segment belonging to an unidentified speaker.
+        enrollments: Map of player name → voice embedding collected during the
+                     enrollment phase (see enroll_speakers()).
+        threshold: Maximum cosine distance to accept a match. Lower values require
+                   closer voice similarity (0-2 scale, default 0.6).
 
     Returns:
-        Player name if matched, or "Unknown" if no match within threshold.
+        The name of the best-matching enrolled player, or "Unknown" if no
+        enrollment is within the threshold.
     """
     from scipy.spatial.distance import cosine
 
@@ -303,29 +303,22 @@ def transcribe(audio: np.ndarray, sample_rate: int = SAMPLE_RATE) -> list[Segmen
     if not _stt_enabled or _whisper_model is None:
         return []
 
-    import whisperx
-
-    wav_path = _save_temp_wav(audio, sample_rate)
-    try:
-        loaded_audio = whisperx.load_audio(wav_path)
-        result = _whisper_model.transcribe(loaded_audio, batch_size=8)
-        return [
-            Segment(
-                speaker="Unknown",
-                text=seg.get("text", "").strip(),
-                start=seg.get("start", 0.0),
-                end=seg.get("end", 0.0),
-            )
-            for seg in result.get("segments", [])
-            if seg.get("text", "").strip()
-        ]
-    finally:
-        os.unlink(wav_path)
+    result = _whisper_model.transcribe(audio, batch_size=8)
+    return [
+        Segment(
+            speaker="Unknown",
+            text=seg.get("text", "").strip(),
+            start=seg.get("start", 0.0),
+            end=seg.get("end", 0.0),
+        )
+        for seg in result.get("segments", [])
+        if seg.get("text", "").strip()
+    ]
 
 
 def transcribe_and_diarize(
     audio: np.ndarray,
-    enrollments: dict[str, np.ndarray] | None = None,
+    enrollments: dict[str, np.ndarray],
     min_speakers: int | None = None,
     max_speakers: int | None = None,
     sample_rate: int = SAMPLE_RATE,
@@ -337,8 +330,7 @@ def transcribe_and_diarize(
 
     Args:
         audio: 1D float32 numpy array of audio samples.
-        enrollments: Speaker enrollment dict from enroll_speakers(). If None,
-                     generic SPEAKER_XX labels are used.
+        enrollments: Speaker enrollment dict from enroll_speakers().
         min_speakers: Minimum expected speakers (optional hint for diarization).
         max_speakers: Maximum expected speakers (optional hint for diarization).
         sample_rate: Audio sample rate.
@@ -355,89 +347,82 @@ def transcribe_and_diarize(
 
     import whisperx
 
-    wav_path = _save_temp_wav(audio, sample_rate)
-    try:
-        loaded_audio = whisperx.load_audio(wav_path)
+    # Step 1: Transcribe
+    console.print("[dim]Transcribing...[/dim]")
+    result = _whisper_model.transcribe(audio, batch_size=8)
 
-        # Step 1: Transcribe
-        console.print("[dim]Transcribing...[/dim]")
-        result = _whisper_model.transcribe(loaded_audio, batch_size=8)
-
-        # Step 2: Align (for word-level timestamps)
-        global _align_model, _align_metadata
-        if _align_model is None:
-            _align_model, _align_metadata = whisperx.load_align_model(
-                language_code=result["language"], device=_device
-            )
-        result = whisperx.align(
-            result["segments"], _align_model, _align_metadata,
-            loaded_audio, _device, return_char_alignments=False,
+    # Step 2: Align (for word-level timestamps)
+    global _align_model, _align_metadata
+    if _align_model is None:
+        _align_model, _align_metadata = whisperx.load_align_model(
+            language_code=result["language"], device=_device
         )
+    result = whisperx.align(
+        result["segments"], _align_model, _align_metadata,
+        audio, _device, return_char_alignments=False,
+    )
 
-        # Step 3: Diarize
-        console.print("[dim]Identifying speakers...[/dim]")
-        diarize_kwargs = {}
-        if min_speakers is not None:
-            diarize_kwargs["min_speakers"] = min_speakers
-        if max_speakers is not None:
-            diarize_kwargs["max_speakers"] = max_speakers
+    # Step 3: Diarize
+    console.print("[dim]Identifying speakers...[/dim]")
+    diarize_kwargs = {}
+    if min_speakers is not None:
+        diarize_kwargs["min_speakers"] = min_speakers
+    if max_speakers is not None:
+        diarize_kwargs["max_speakers"] = max_speakers
 
-        diarize_segments = _diarize_pipeline(
-            loaded_audio, **diarize_kwargs
-        )
-        result = whisperx.assign_word_speakers(diarize_segments, result)
+    diarize_segments = _diarize_pipeline(
+        audio, **diarize_kwargs
+    )
+    result = whisperx.assign_word_speakers(diarize_segments, result)
 
-        # Step 4: Map speaker labels to player names via embeddings
-        speaker_label_to_name: dict[str, str] = {}
-        if enrollments and _embedding_inference is not None:
-            unique_speakers = set()
-            for seg in result.get("segments", []):
-                spk = seg.get("speaker")
-                if spk:
-                    unique_speakers.add(spk)
-
-            for spk_label in unique_speakers:
-                # Collect audio for this speaker
-                spk_segments = [
-                    s for s in result["segments"] if s.get("speaker") == spk_label
-                ]
-                if not spk_segments:
-                    continue
-
-                # Use the longest segment for best embedding quality
-                longest = max(spk_segments, key=lambda s: s.get("end", 0) - s.get("start", 0))
-                start_sample = int(longest["start"] * sample_rate)
-                end_sample = int(longest["end"] * sample_rate)
-                spk_audio = audio[start_sample:end_sample]
-
-                if len(spk_audio) < sample_rate * 0.5:
-                    # Too short for reliable embedding
-                    continue
-
-                spk_embedding = _extract_embedding(spk_audio, sample_rate)
-                matched_name = _match_speaker_to_player(spk_embedding, enrollments)
-                speaker_label_to_name[spk_label] = matched_name
-
-        # Build output segments
-        segments = []
+    # Step 4: Map speaker labels to player names via embeddings
+    speaker_label_to_name: dict[str, str] = {}
+    if _embedding_inference is not None:
+        unique_speakers = set()
         for seg in result.get("segments", []):
-            text = seg.get("text", "").strip()
-            if not text:
+            spk = seg.get("speaker")
+            if spk:
+                unique_speakers.add(spk)
+
+        for spk_label in unique_speakers:
+            # Collect audio for this speaker
+            spk_segments = [
+                s for s in result["segments"] if s.get("speaker") == spk_label
+            ]
+            if not spk_segments:
                 continue
-            raw_speaker = seg.get("speaker", "Unknown")
-            speaker = speaker_label_to_name.get(raw_speaker, raw_speaker)
-            segments.append(Segment(
-                speaker=speaker,
-                text=text,
-                start=seg.get("start", 0.0),
-                end=seg.get("end", 0.0),
-            ))
 
-        console.print(f"[dim]Transcribed {len(segments)} segments.[/dim]")
-        return segments
+            # Use the longest segment for best embedding quality
+            longest = max(spk_segments, key=lambda s: s.get("end", 0) - s.get("start", 0))
+            start_sample = int(longest["start"] * sample_rate)
+            end_sample = int(longest["end"] * sample_rate)
+            spk_audio = audio[start_sample:end_sample]
 
-    finally:
-        os.unlink(wav_path)
+            if len(spk_audio) < sample_rate * 0.5:
+                # Too short for reliable embedding
+                continue
+
+            spk_embedding = _extract_embedding(spk_audio, sample_rate)
+            matched_name = _match_speaker_to_player(spk_embedding, enrollments)
+            speaker_label_to_name[spk_label] = matched_name
+
+    # Build output segments
+    segments = []
+    for seg in result.get("segments", []):
+        text = seg.get("text", "").strip()
+        if not text:
+            continue
+        raw_speaker = seg.get("speaker", "Unknown")
+        speaker = speaker_label_to_name.get(raw_speaker, raw_speaker)
+        segments.append(Segment(
+            speaker=speaker,
+            text=text,
+            start=seg.get("start", 0.0),
+            end=seg.get("end", 0.0),
+        ))
+
+    console.print(f"[dim]Transcribed {len(segments)} segments.[/dim]")
+    return segments
 
 
 def format_transcript(segments: list[Segment]) -> str:

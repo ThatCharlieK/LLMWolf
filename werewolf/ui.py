@@ -4,7 +4,6 @@ import os
 import select
 import sys
 import time
-from pathlib import Path
 
 from rich.console import Console
 from rich.panel import Panel
@@ -23,45 +22,10 @@ ROLE_COLORS = {
     "Witch": "purple",
 }
 
-# Resolve sounds directory relative to this file's package
-_SOUNDS_DIR = Path(__file__).resolve().parent.parent / "sounds"
-_sound_enabled = False
-
 
 def clear_screen():
     """Clear the terminal screen."""
     os.system("cls" if os.name == "nt" else "clear")
-
-
-def init_sound():
-    """Initialize the pygame mixer for sound playback."""
-    global _sound_enabled
-    try:
-        import pygame
-        pygame.mixer.init()
-        _sound_enabled = True
-    except Exception:
-        _sound_enabled = False
-
-
-def play_sound(filename: str):
-    """Play an mp3 from the sounds/ directory. Blocks until finished.
-
-    Silently skips if sound is not initialized or files are missing.
-    """
-    if not _sound_enabled:
-        return
-    filepath = _SOUNDS_DIR / filename
-    if not filepath.exists():
-        return
-    try:
-        import pygame
-        pygame.mixer.music.load(str(filepath))
-        pygame.mixer.music.play()
-        while pygame.mixer.music.get_busy():
-            time.sleep(0.1)
-    except Exception:
-        return
 
 
 def show_panel(title: str, body: str, style: str = "blue"):
@@ -97,7 +61,7 @@ def countdown(seconds: int, label: str, interruptible: bool = False) -> int:
                     return remaining
             else:
                 time.sleep(1)
-    play_sound("vote.mp3")
+    speak("Time to vote.")
     console.print()
     show_panel("Time's Up!", "Discussion period is over.", style="red")
     return 0

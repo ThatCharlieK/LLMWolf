@@ -3,12 +3,16 @@
 import questionary
 from rich.console import Console
 
+from copy import deepcopy
+
 from werewolf.state import GameState, setup_game
 from werewolf.night import run_night
 from werewolf.day import run_day
 from werewolf.vote import run_vote
+from werewolf.llm import is_ai_player
+from werewolf.logger import log_game
 from werewolf.ui import (
-    clear_screen, init_sound, init_tts_ui, show_panel, show_big_text,
+    clear_screen, init_tts_ui, show_panel, show_big_text,
     pause, ROLE_COLORS, wait_for_enter,
 )
 
@@ -48,6 +52,10 @@ def run_peek_phase(state: GameState):
     wait_for_enter()
 
     for player in state.players:
+        if is_ai_player(player):
+            # AI reads its role directly from state — no UI needed
+            continue
+
         clear_screen()
         show_panel(
             "Pass the Laptop",
@@ -83,11 +91,7 @@ def run_enrollment(players: list[str]) -> dict:
     Each player records a short voice sample so the system can identify
     who is speaking during the day discussion phase.
     """
-    try:
-        from werewolf.stt import init_stt, enroll_speakers
-    except ImportError:
-        console.print("[dim]STT not available — skipping voice enrollment.[/dim]")
-        return {}
+    from werewolf.stt import init_stt, enroll_speakers
 
     clear_screen()
     show_big_text("VOICE ENROLLMENT", style="bold blue")
@@ -98,36 +102,31 @@ def run_enrollment(players: list[str]) -> dict:
         style="blue",
     )
 
-    confirm = questionary.confirm(
-        "Enable voice recording for this game?", default=True
-    ).ask()
-    if not confirm:
-        return {}
-
     init_stt()
-    enrollments = enroll_speakers(players)
+    human_players = [p for p in players if not is_ai_player(p)]
+    enrollments = enroll_speakers(human_players)
 
-    if enrollments:
-        console.print(
-            f"\n[green]Enrolled {len(enrollments)}/{len(players)} players.[/green]"
-        )
+    console.print(
+        f"\n[green]Enrolled {len(enrollments)}/{len(players)} players.[/green]"
+    )
     wait_for_enter()
     return enrollments
 
 
 def main():
     """Run the full game loop: title → setup → peek → night → day → vote → replay."""
-    init_sound()
     init_tts_ui()
 
     while True:
         show_title_screen()
         state = setup_game()
+        starting_state = deepcopy(state)
         enrollments = run_enrollment(state.players)
         run_peek_phase(state)
         state = run_night(state)
         run_day(state, enrollments=enrollments)
-        run_vote(state)
+        result = run_vote(state)
+        log_game(starting_state, state, result["votes"], result["winner"])
 
         console.print()
         play_again = questionary.confirm("Play again?", default=True).ask()

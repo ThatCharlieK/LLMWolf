@@ -7,22 +7,24 @@ from rich.console import Console
 from rich.table import Table
 
 from werewolf.state import GameState, get_role_team
+from werewolf.llm import is_ai_player, get_vote
 from werewolf.ui import (
-    clear_screen, play_sound, show_panel, show_big_text,
-    pause, ROLE_COLORS, wait_for_enter,
+    clear_screen, show_panel, show_big_text,
+    pause, ROLE_COLORS, wait_for_enter, speak,
 )
 
 console = Console()
 
 
-def run_vote(state: GameState):
+def run_vote(state: GameState) -> dict:
     """Handle the full voting phase: collect votes, tally, resolve, and reveal.
 
     Displays the endgame results including roles, night log, and winner.
+    Returns a dict with 'votes' and 'winner' keys for logging.
     """
     clear_screen()
     show_big_text("VOTING PHASE", style="bold magenta")
-    play_sound("vote.mp3")
+    speak("Time to vote.")
 
     show_panel(
         "Vote",
@@ -35,28 +37,33 @@ def run_vote(state: GameState):
     # Collect votes
     votes = {}
     for player in state.players:
-        clear_screen()
-        show_panel(
-            f"{player}'s Vote",
-            f"[bold]{player}[/bold], who do you vote to eliminate?",
-            style="magenta",
-        )
-
         choices = [p for p in state.players if p != player] + ["No one"]
-        vote = questionary.select(
-            "Your vote:",
-            choices=choices,
-        ).ask()
+
+        if is_ai_player(player):
+            ai_role = state.original_roles.get(player, "Unknown")
+            vote = get_vote(ai_role, choices, state.discussion_transcript)
+        else:
+            clear_screen()
+            show_panel(
+                f"{player}'s Vote",
+                f"[bold]{player}[/bold], who do you vote to eliminate?",
+                style="magenta",
+            )
+            vote = questionary.select(
+                "Your vote:",
+                choices=choices,
+            ).ask()
+            clear_screen()
 
         votes[player] = vote
-        clear_screen()
 
     # Tally and resolve
-    _resolve_votes(state, votes)
+    winner = _resolve_votes(state, votes)
+    return {"votes": votes, "winner": winner}
 
 
-def _resolve_votes(state: GameState, votes: dict[str, str]):
-    """Tally votes, determine elimination, and display endgame results."""
+def _resolve_votes(state: GameState, votes: dict[str, str]) -> str:
+    """Tally votes, determine elimination, and display endgame results. Returns winner."""
     clear_screen()
     show_big_text("RESULTS", style="bold white")
 
@@ -134,6 +141,8 @@ def _resolve_votes(state: GameState, votes: dict[str, str]):
     if state.night_log:
         log_text = "\n".join(f"  {entry}" for entry in state.night_log)
         show_panel("Night Log", log_text, style="dim")
+
+    return winner
 
 
 def _determine_winner(state: GameState, eliminated: list[str]) -> str:

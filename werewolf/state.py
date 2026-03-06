@@ -8,6 +8,7 @@ import questionary
 from rich.console import Console
 from rich.table import Table
 
+from werewolf.llm import AI_PLAYER_NAME
 from werewolf.ui import clear_screen, show_panel, show_big_text, ROLE_COLORS
 
 console = Console()
@@ -67,7 +68,7 @@ def setup_game() -> GameState:
         choices=[str(n) for n in range(3, 7)],
     ).ask())
 
-    # 2. Player names
+    # 2. Player names (human players only — AI is added automatically)
     players = []
     for i in range(1, num_players + 1):
         while True:
@@ -77,14 +78,19 @@ def setup_game() -> GameState:
             ).ask().strip()
             if name in players:
                 console.print(f"[red]'{name}' is already taken. Choose a different name.[/red]")
+            elif name == AI_PLAYER_NAME:
+                console.print(f"[red]'{AI_PLAYER_NAME}' is reserved for the AI player.[/red]")
             else:
                 players.append(name)
                 break
 
-    total_cards = num_players + 3
+    # Claude is always a player
+    players.append(AI_PLAYER_NAME)
+    total_players = len(players)
+    total_cards = total_players + 3
 
     # 3. Role selection
-    console.print(f"\n[bold]Select exactly {total_cards} role cards[/bold] (= {num_players} players + 3 center)\n")
+    console.print(f"\n[bold]Select exactly {total_cards} role cards[/bold] (= {total_players} players + 3 center)\n")
 
     # Build choices: expand each role into individual copies
     role_choices = []
@@ -98,7 +104,7 @@ def setup_game() -> GameState:
             ))
 
     # Pre-check a sensible default set
-    defaults = _get_default_roles(num_players)
+    defaults = _get_default_roles(total_players)
     for choice in role_choices:
         role, idx = choice.value
         count_needed = sum(1 for r in defaults if r == role)
@@ -127,7 +133,7 @@ def setup_game() -> GameState:
     dealt_roles = {}
     for i, player in enumerate(players):
         dealt_roles[player] = role_cards[i]
-    center = role_cards[num_players:]
+    center = role_cards[total_players:]
 
     return GameState(
         players=players,
