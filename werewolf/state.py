@@ -65,7 +65,7 @@ def setup_game() -> GameState:
     # 1. Player count
     num_players = int(questionary.select(
         "How many players?",
-        choices=[str(n) for n in range(3, 7)],
+        choices=[str(n) for n in range(2, 7)],
     ).ask())
 
     # 2. Player names (human players only — AI is added automatically)
