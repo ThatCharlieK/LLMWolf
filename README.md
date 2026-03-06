@@ -5,6 +5,13 @@ Recent work has explored LLM performance in social deduction games (SDGs), but a
 
 Terminal-based **One Night Ultimate Werewolf** for 3–6 human players, run from a single laptop by a moderator. **macOS only.**
 
+<p align="center">
+<img src="https://raw.githubusercontent.com/ThatCharlieK/READMEAssets/main/VotingScreen.png" width="400"/>
+</p>
+<p align="center">
+<img src="https://raw.githubusercontent.com/ThatCharlieK/READMEAssets/main/DiscussionScreen.png" width="400"/>
+</p>
+
 ## Tech Stack
 
 - **Python 3.11+**
