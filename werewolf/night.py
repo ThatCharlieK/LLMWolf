@@ -4,7 +4,7 @@ import questionary
 from rich.console import Console
 
 from werewolf.state import GameState, get_role_team
-from werewolf.llm import is_ai_player, get_night_action, get_checkbox_action
+from werewolf.llm import is_ai_player, get_night_action, get_checkbox_action, notify_night_result
 from werewolf.ui import (
     clear_screen, show_panel, show_big_text,
     pause, ROLE_COLORS, wait_for_enter, speak,
@@ -56,7 +56,8 @@ def run_night(state: GameState) -> GameState:
         role_players = [p for p in state.players if state.original_roles[p] == role]
 
         if not role_players:
-            # Role exists only in center — skip the action
+            # Role is only in center — still narrate to hide this fact
+            _fake_role_narration(role)
             continue
 
         _run_role_action(state, role, role_players)
@@ -98,6 +99,20 @@ def _run_role_action(state: GameState, role: str, role_players: list[str]):
     pause(3)
 
 
+def _fake_role_narration(role: str):
+    """Narrate wake/close lines for a role with no active player.
+
+    Prevents players from deducing which roles are in the center
+    by maintaining consistent narration for every role in the game.
+    """
+    clear_screen()
+    speak(WAKE_LINES[role])
+    pause(5)
+    speak(CLOSE_LINES[role])
+    clear_screen()
+    pause(3)
+
+
 def _werewolf_action(state: GameState, werewolf_players: list[str]):
     """Werewolf night action.
 
@@ -114,7 +129,9 @@ def _werewolf_action(state: GameState, werewolf_players: list[str]):
             style=color,
         )
         state.night_log.append(f"Werewolves ({names}) saw each other.")
-        if not any(is_ai_player(p) for p in werewolf_players):
+        if any(is_ai_player(p) for p in werewolf_players):
+            notify_night_result(f"The werewolves are: {names}. You saw each other.")
+        else:
             wait_for_enter()
     else:
         player = werewolf_players[0]
@@ -145,6 +162,8 @@ def _werewolf_action(state: GameState, werewolf_players: list[str]):
                 f"The card is: [bold {card_color}]{card}[/bold {card_color}]",
                 style=color,
             )
+        if is_ai_player(player):
+            notify_night_result(f"You looked at center card {idx + 1}. It is the {card}.")
         state.night_log.append(
             f"{player} (Lone Werewolf) looked at center card {idx + 1}: {card}."
         )
@@ -194,6 +213,8 @@ def _seer_action(state: GameState, player: str):
                 f"{target} is the [bold {role_color}]{role}[/bold {role_color}]",
                 style=color,
             )
+        if is_ai_player(player):
+            notify_night_result(f"You looked at {target}'s card. They are the {role}.")
         state.night_log.append(f"{player} (Seer) looked at {target}'s card: {role}.")
 
     else:
@@ -226,6 +247,11 @@ def _seer_action(state: GameState, player: str):
             )
         indices = [int(c.split()[-1]) - 1 for c in chosen]
         cards = [state.center_cards[i] for i in indices]
+        if is_ai_player(player):
+            notify_night_result(
+                f"You looked at center cards {indices[0]+1} and {indices[1]+1}: "
+                f"{cards[0]} and {cards[1]}."
+            )
         state.night_log.append(
             f"{player} (Seer) looked at center cards {indices[0]+1} and {indices[1]+1}: "
             f"{cards[0]} and {cards[1]}."
@@ -271,6 +297,8 @@ def _robber_action(state: GameState, player: str):
             f"Your new role is: [bold {new_color}]{new_role}[/bold {new_color}]",
             style=color,
         )
+    if is_ai_player(player):
+        notify_night_result(f"You swapped cards with {target}. Your new role is {new_role}.")
     state.night_log.append(
         f"{player} (Robber) swapped cards with {target}. "
         f"{player} is now {new_role}. {target} is now Robber."
@@ -319,6 +347,8 @@ def _troublemaker_action(state: GameState, player: str):
             f"You swapped {first}'s and {second}'s cards.",
             style=color,
         )
+    if is_ai_player(player):
+        notify_night_result(f"You swapped {first}'s and {second}'s cards.")
     state.night_log.append(
         f"{player} (Troublemaker) swapped {first}'s and {second}'s cards."
     )
@@ -349,7 +379,9 @@ def _witch_action(state: GameState, player: str):
         ).ask()
 
     if action == "No":
-        if not is_ai_player(player):
+        if is_ai_player(player):
+            notify_night_result("You chose not to act.")
+        else:
             show_panel("Done", "You chose not to act.", style=color)
         state.night_log.append(f"{player} (Witch) chose not to act.")
         return
@@ -395,6 +427,11 @@ def _witch_action(state: GameState, player: str):
             "Done",
             f"You swapped center card {idx + 1} with {target}'s card.",
             style=color,
+        )
+    if is_ai_player(player):
+        notify_night_result(
+            f"You looked at center card {idx + 1} ({card}) "
+            f"and swapped it with {target}'s card."
         )
     state.night_log.append(
         f"{player} (Witch) looked at center card {idx + 1} ({card}) "

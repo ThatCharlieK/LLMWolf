@@ -1,4 +1,4 @@
-"""Day phase: discussion period with countdown timer and optional recording."""
+"""Day phase: discussion period with countdown timer and chunked recording."""
 
 import threading
 import time
@@ -20,143 +20,135 @@ DISCUSSION_TIME = 300
 AI_SPEAK_INTERVAL = 30
 
 
-def _record_background(
+def _record_chunk(
     duration: float,
-    result_holder: dict[str, object],
     stop_event: threading.Event,
-    mute_event: threading.Event | None = None,
-) -> None:
-    """
-    Record microphone audio in a background thread for the day discussion.
+    sample_rate: int = 16000,
+) -> tuple[np.ndarray | None, int]:
+    """Record a chunk of microphone audio, stoppable early via stop_event.
 
-    Uses PortAudio's callback-based streaming API (via sounddevice) rather than
-    the simpler sd.rec() because the recording must be stoppable early from the
-    main thread when a player ends discussion. The callback is the only clean way
-    to receive audio chunks incrementally and signal PortAudio to stop gracefully
-    via sd.CallbackStop().
-
-    Audio is captured at 16kHz mono float32 — the format expected by downstream
-    STT models (Whisper). Using the system default sample rate / channels would
-    require resampling later.
+    Uses PortAudio callback streaming at 16kHz mono float32 (Whisper format).
+    Returns the captured audio trimmed to actual length.
 
     :param duration: Maximum recording length in seconds.
-    :type duration: float
-    :param result_holder: Mutable dict written to from this thread. On success,
-        populated with 'audio' (np.ndarray) and 'sample_rate' (int).
-        On failure, populated with 'error' (str).
-    :type result_holder: dict[str, object]
-    :param stop_event: Set by the main thread to end recording early.
-    :type stop_event: threading.Event
-    :param mute_event: When set, the callback writes silence instead of mic
-        audio. Used to prevent TTS playback from being captured.
-    :type mute_event: threading.Event | None
+    :param stop_event: Set externally to end recording early.
+    :param sample_rate: Audio sample rate (default 16kHz for Whisper).
+    :returns: Tuple of (audio array or None on error, sample rate).
     """
     try:
         import sounddevice as sd
 
-        sample_rate: int = 16000
-        frames_needed: int = int(duration * sample_rate)
-        # Pre-allocate the full buffer upfront to avoid growing a list of chunks
-        audio: np.ndarray = np.zeros(frames_needed, dtype="float32")
-        # Mutable container so the callback (which runs on PortAudio's C thread)
-        # can update the write position across invocations
-        actual_frames: list[int] = [0]
+        frames_needed = int(duration * sample_rate)
+        audio = np.zeros(frames_needed, dtype="float32")
+        actual_frames = [0]
 
-        def callback(
-            indata: np.ndarray,
-            frame_count: int,
-            _time_info: object,
-            _status: sd.CallbackFlags,
-        ) -> None:
-            """
-            Called by PortAudio each time a new chunk of mic samples arrives.
-
-            Copies incoming mono samples into the pre-allocated buffer and
-            raises CallbackStop when the buffer is full or stop_event is set.
-            When mute_event is set, writes silence (zeros) instead of mic data
-            to prevent TTS playback from being captured and re-transcribed.
-
-            :param indata: Incoming audio samples from the microphone.
-            :type indata: np.ndarray
-            :param frame_count: Number of frames in this chunk.
-            :type frame_count: int
-            :param _time_info: PortAudio timing metadata (unused).
-            :type _time_info: object
-            :param _status: Stream status flags (e.g. overflow warnings).
-            :type _status: sd.CallbackFlags
-            """
-            start: int = actual_frames[0]
-            end: int = min(start + frame_count, frames_needed)
-            count: int = end - start
-            if mute_event is not None and mute_event.is_set():
-                audio[start:end] = 0.0
-            else:
-                audio[start:end] = indata[:count, 0]
+        def callback(indata, frame_count, _time_info, _status):
+            start = actual_frames[0]
+            end = min(start + frame_count, frames_needed)
+            count = end - start
+            audio[start:end] = indata[:count, 0]
             actual_frames[0] = end
             if end >= frames_needed or stop_event.is_set():
-                # Tells PortAudio to drain remaining samples and stop cleanly
                 raise sd.CallbackStop()
 
-        stream: sd.InputStream = sd.InputStream(
+        stream = sd.InputStream(
             samplerate=sample_rate,
-            channels=1,       # mono — stereo adds no value for speech recognition
-            dtype="float32",  # native format for numpy and Whisper
+            channels=1,
+            dtype="float32",
             callback=callback,
         )
         stream.start()
-        # Block this thread until duration elapses or main thread signals stop
         stop_event.wait(timeout=duration)
         stream.stop()
         stream.close()
 
-        # Trim to only the frames actually written by the callback
-        result_holder["audio"] = audio[: actual_frames[0]]
-        result_holder["sample_rate"] = sample_rate
+        return audio[: actual_frames[0]], sample_rate
     except Exception as e:
-        result_holder["error"] = str(e)
+        console.print(f"[dim]Recording error: {e}[/dim]")
+        return None, sample_rate
 
 
-def _llm_discussion_loop(
+def _discussion_loop(
     state: GameState,
     stop_event: threading.Event,
-    mute_event: threading.Event,
-    ai_segments: list[dict],
-    rec_start_time: float,
-):
-    """Background thread that has the AI speak every AI_SPEAK_INTERVAL seconds.
+    timer_pause: threading.Event,
+    enrollments: dict,
+) -> None:
+    """Background thread: record → transcribe → AI response → TTS, repeating.
 
-    Mutes the mic recording while TTS plays to prevent Claude's speech from
-    being captured and re-transcribed. Instead, Claude's utterances are tracked
-    in ai_segments and merged into the transcript after STT processing.
+    Each cycle records a chunk of audio, transcribes it with speaker
+    diarization, appends the new segments to state.discussion_transcript,
+    then has the AI respond based on the accumulated transcript.
+    The timer is paused during transcription/LLM/TTS so players don't
+    lose discussion time while the AI is processing.
 
-    :param state: Current game state (for role info and transcript context).
+    :param state: Current game state (transcript is mutated in place).
     :param stop_event: Set by the main thread to end the discussion.
-    :param mute_event: Set while TTS is playing to silence mic capture.
-    :param ai_segments: Mutable list that accumulates Claude's utterances as
-        dicts with 'speaker', 'text', 'start', and 'end' keys.
-    :param rec_start_time: Wall-clock time when recording started, used to
-        compute segment timestamps relative to the audio stream.
+    :param timer_pause: Set to pause the countdown timer, cleared to resume.
+    :param enrollments: Speaker enrollment embeddings for diarization.
     """
+    from werewolf.stt import transcribe_and_diarize
+
     ai_role = state.original_roles.get(AI_PLAYER_NAME, "Unknown")
+    human_count = sum(1 for p in state.players if not is_ai_player(p))
+    discussion_start = time.time()
 
     while not stop_event.is_set():
-        if stop_event.wait(timeout=AI_SPEAK_INTERVAL):
+        # 1. Record a chunk (timer runs — players are talking)
+        time_offset = time.time() - discussion_start
+        console.print("[dim]Recording...[/dim]")
+        audio, sr = _record_chunk(AI_SPEAK_INTERVAL, stop_event)
+
+        # 2. Pause the timer while we process
+        timer_pause.set()
+
+        # 3. Transcribe the chunk
+        if audio is not None and len(audio) >= sr * 0.5:
+            try:
+                console.print("[dim]Transcribing...[/dim]")
+                segments = transcribe_and_diarize(
+                    audio,
+                    enrollments=enrollments,
+                    min_speakers=1,
+                    max_speakers=max(1, human_count),
+                )
+                for seg in segments:
+                    state.discussion_transcript.append({
+                        "speaker": seg.speaker,
+                        "text": seg.text,
+                        "start": seg.start + time_offset,
+                        "end": seg.end + time_offset,
+                    })
+            except Exception as e:
+                console.print(f"[dim]Transcription error: {e}[/dim]")
+
+        # 4. If discussion ended during recording/transcription, stop
+        if stop_event.is_set():
+            timer_pause.clear()
             break
 
+        # 5. Get AI response with the accumulated transcript
         response = get_day_response(ai_role, state.discussion_transcript)
 
-        start = time.time() - rec_start_time
-        mute_event.set()
-        speak(response)
-        mute_event.clear()
-        end = time.time() - rec_start_time
+        if stop_event.is_set():
+            timer_pause.clear()
+            break
 
-        ai_segments.append({
+        # 6. Speak via TTS (blocking — no recording happening, so no mic feedback)
+        tts_start = time.time() - discussion_start
+        speak(response)
+        tts_end = time.time() - discussion_start
+
+        # 7. Add AI utterance to the running transcript
+        state.discussion_transcript.append({
             "speaker": AI_PLAYER_NAME,
             "text": response,
-            "start": start,
-            "end": end,
+            "start": tts_start,
+            "end": tts_end,
         })
+
+        # 8. Resume the timer — back to recording
+        timer_pause.clear()
 
 
 def run_day(state: GameState, enrollments: dict):
@@ -164,7 +156,8 @@ def run_day(state: GameState, enrollments: dict):
 
     Players discuss in real life while the timer counts down.
     Pressing Enter pauses the timer and prompts to end early (with confirmation).
-    Records and transcribes the discussion with speaker diarization.
+    Records and transcribes the discussion in 30-second chunks so the AI can
+    hear and respond to what players actually say.
     """
     clear_screen()
     show_big_text("DAY PHASE", style="bold yellow")
@@ -184,31 +177,19 @@ def run_day(state: GameState, enrollments: dict):
     console.print("[dim]Press Enter to end discussion early[/dim]\n")
 
     stop_event = threading.Event()
-    mute_event = threading.Event()
-    record_result: dict = {}
-    ai_segments: list[dict] = []
-    rec_start_time = time.time()
+    timer_pause = threading.Event()
 
-    # Start background recording
-    console.print("[dim]Recording discussion...[/dim]")
-    record_thread = threading.Thread(
-        target=_record_background,
-        args=(DISCUSSION_TIME, record_result, stop_event, mute_event),
+    # Start the unified discussion loop (record → transcribe → AI → TTS)
+    discussion_thread = threading.Thread(
+        target=_discussion_loop,
+        args=(state, stop_event, timer_pause, enrollments),
         daemon=True,
     )
-    record_thread.start()
-
-    # Start AI discussion thread
-    llm_thread = threading.Thread(
-        target=_llm_discussion_loop,
-        args=(state, stop_event, mute_event, ai_segments, rec_start_time),
-        daemon=True,
-    )
-    llm_thread.start()
+    discussion_thread.start()
 
     remaining = DISCUSSION_TIME
     while remaining > 0:
-        remaining = countdown(remaining, "Discussion time remaining", interruptible=True)
+        remaining = countdown(remaining, "Discussion time remaining", interruptible=True, pause_event=timer_pause)
         if remaining > 0:
             confirm = questionary.confirm(
                 "Are you sure you want to end discussion early?",
@@ -222,47 +203,27 @@ def run_day(state: GameState, enrollments: dict):
             console.print(f"\nPlayers: {player_list}\n")
             console.print("[dim]Press Enter to end discussion early[/dim]\n")
 
-    # Stop recording and transcribe
+    # Stop discussion and wait for thread to finish
     stop_event.set()
-    record_thread.join(timeout=5.0)
+    discussion_thread.join(timeout=30.0)
 
-    audio = record_result.get("audio")
-    if audio is not None and len(audio) > 0:
-        try:
-            from werewolf.stt import transcribe_and_diarize, format_transcript, Segment
+    # Display the accumulated transcript
+    if state.discussion_transcript:
+        from werewolf.stt import format_transcript, Segment
 
-            console.print("\n[dim]Transcribing discussion...[/dim]")
-            # Only count human speakers for diarization hints
-            human_count = sum(
-                1 for p in state.players if not is_ai_player(p)
+        segments = [
+            Segment(
+                speaker=d["speaker"],
+                text=d["text"],
+                start=d["start"],
+                end=d["end"],
             )
-            segments = transcribe_and_diarize(
-                audio,
-                enrollments=enrollments,
-                min_speakers=max(2, human_count),
-                max_speakers=human_count,
-            )
-
-            # Merge AI segments (tracked during TTS) into the transcript
-            for ai_seg in ai_segments:
-                segments.append(Segment(
-                    speaker=ai_seg["speaker"],
-                    text=ai_seg["text"],
-                    start=ai_seg["start"],
-                    end=ai_seg["end"],
-                ))
-            segments.sort(key=lambda s: s.start)
-
-            state.discussion_transcript = [
-                {"speaker": s.speaker, "text": s.text, "start": s.start, "end": s.end}
-                for s in segments
-            ]
-            transcript = format_transcript(segments)
-            if transcript:
-                console.print("\n[bold]Discussion Transcript:[/bold]")
-                console.print(transcript)
-                console.print()
-        except Exception as e:
-            console.print(f"[yellow]Transcription failed: {e}[/yellow]")
-    elif "error" in record_result:
-        console.print(f"[yellow]Recording failed: {record_result['error']}[/yellow]")
+            for d in state.discussion_transcript
+        ]
+        transcript = format_transcript(segments)
+        if transcript:
+            console.print("\n[bold]Discussion Transcript:[/bold]")
+            console.print(transcript)
+            console.print()
+    else:
+        console.print("[dim]No discussion was transcribed.[/dim]")

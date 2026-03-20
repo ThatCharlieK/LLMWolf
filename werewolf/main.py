@@ -9,7 +9,8 @@ from werewolf.state import GameState, setup_game
 from werewolf.night import run_night
 from werewolf.day import run_day
 from werewolf.vote import run_vote
-from werewolf.llm import is_ai_player
+from werewolf.llm import is_ai_player, set_llm, notify_role, reset_conversation, AI_PLAYER_NAME
+from werewolf.claude_llm import ClaudeLLM
 from werewolf.logger import log_game
 from werewolf.ui import (
     clear_screen, init_tts_ui, show_panel, show_big_text,
@@ -116,11 +117,17 @@ def run_enrollment(players: list[str]) -> dict:
 def main():
     """Run the full game loop: title → setup → peek → night → day → vote → replay."""
     init_tts_ui()
+    set_llm(ClaudeLLM())
 
     while True:
         show_title_screen()
+        reset_conversation()
         state = setup_game()
         starting_state = deepcopy(state)
+
+        # Seed the AI with its role and player list
+        if AI_PLAYER_NAME in state.players:
+            notify_role(state.original_roles[AI_PLAYER_NAME], state.players)
         enrollments = run_enrollment(state.players)
         run_peek_phase(state)
         state = run_night(state)

@@ -41,15 +41,37 @@ def show_big_text(text: str, style: str = "bold white"):
     console.print()
 
 
-def countdown(seconds: int, label: str, interruptible: bool = False) -> int:
+def countdown(
+    seconds: int,
+    label: str,
+    interruptible: bool = False,
+    pause_event: "threading.Event | None" = None,
+) -> int:
     """Show a live countdown timer in the terminal.
 
     Displays like: "Discussion time remaining: 3:24"
     When interruptible=True, pressing Enter breaks out early.
+    When pause_event is provided and set, the timer freezes until cleared.
     Returns remaining seconds (0 if completed normally, >0 if interrupted).
     """
+    import threading
+
     with Live(console=console, refresh_per_second=2) as live:
         for remaining in range(seconds, 0, -1):
+            # Spin while paused, still updating the display
+            while pause_event is not None and pause_event.is_set():
+                mins, secs = divmod(remaining, 60)
+                live.update(
+                    Text(f"{label}: {mins}:{secs:02d} [PAUSED]", style="bold yellow"),
+                )
+                if interruptible:
+                    ready, _, _ = select.select([sys.stdin], [], [], 0.25)
+                    if ready:
+                        sys.stdin.readline()
+                        return remaining
+                else:
+                    time.sleep(0.25)
+
             mins, secs = divmod(remaining, 60)
             live.update(
                 Text(f"{label}: {mins}:{secs:02d}", style="bold cyan"),
